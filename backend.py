@@ -34,6 +34,10 @@ CHUNK_SIZE = 500          # words per RAG chunk
 CHUNK_OVERLAP = 50        # word overlap between chunks
 MAX_RAG_CHUNKS = 5        # how many chunks to inject per message
 
+# Global queue for memory extraction jobs — ensures we never hit llama-server
+# while it's busy with a chat request
+memory_queue: asyncio.Queue = asyncio.Queue()
+
 
 # ---------------------------------------------------------------------------
 # Database
@@ -257,7 +261,14 @@ def build_rag_context(chunks: list[dict]) -> str:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    # Start the background memory extraction worker
+    worker_task = asyncio.create_task(memory_queue_worker())
     yield
+    worker_task.cancel()
+    try:
+        await worker_task
+    except asyncio.CancelledError:
+        pass
 
 
 app = FastAPI(title="LMChat", lifespan=lifespan)
@@ -580,6 +591,234 @@ async def chat(cid: str, request: Request):
     conn.close()
     return StreamingResponse(stream_response(), media_type="text/event-stream",
                              headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"})
+
+
+# ---------------------------------------------------------------------------
+# Auto Memory Extraction — queue-based so we never hit llama-server concurrently
+# ---------------------------------------------------------------------------
+MEMORY_EXTRACTION_PROMPT = (
+    "You are a memory extractor. Your only job is to read a conversation and output a JSON array "
+    "of facts about the user worth remembering permanently.\n\n"
+    "CAPTURE EVERYTHING including:\n"
+    "- Name, age, location, family, pets\n"
+    "- Job, employer, skills, tools, side projects\n"
+    "- Food & drink preferences (e.g. how they take coffee, dietary restrictions, favorites)\n"
+    "- Hobbies, interests, sports, entertainment preferences\n"
+    "- Opinions, values, things they like or dislike\n"
+    "- Goals, plans, things they are working on\n"
+    "- Health, constraints, allergies\n"
+    "- Anything the user explicitly asks to be remembered\n\n"
+    "FORMAT RULES:\n"
+    "- Every memory starts with 'User'\n"
+    "- One fact per string, concise and specific\n"
+    "- Output ONLY the raw JSON array — no thinking, no explanation, no markdown fences\n"
+    "- If the user said nothing personal at all, output exactly: []\n\n"
+    "EXAMPLES:\n"
+    "'I take my coffee black'  →  'User takes their coffee black'\n"
+    "'please remember I hate mornings'  →  'User dislikes mornings'\n"
+    "'I'm a mainframe developer at Northwestern Mutual'  →  'User is a mainframe developer at Northwestern Mutual'\n"
+    "'my dog is named Max'  →  'User has a dog named Max'\n\n"
+    "OUTPUT FORMAT: [\"User fact one\", \"User fact two\"]"
+)
+
+
+async def wait_for_server_free(lm_url: str, max_wait: int = 30) -> bool:
+    """Poll /health until llama-server reports status=ok, up to max_wait seconds."""
+    deadline = time.time() + max_wait
+    async with httpx.AsyncClient(timeout=3) as client:
+        while time.time() < deadline:
+            try:
+                r = await client.get(f"{lm_url}/health")
+                data = r.json()
+                status = data.get("status", "")
+                if status == "ok":
+                    return True
+                # "loading model" or "no slot available" — wait and retry
+                print(f"[memory] server status: {status!r}, waiting...")
+            except Exception:
+                pass
+            await asyncio.sleep(1)
+    return False
+
+
+async def run_memory_extraction(cid: str, lm_url: str, model: str):
+    """The actual extraction logic — runs inside the queue worker."""
+    import re as _re
+
+    conn = get_db()
+    history = conn.execute(
+        "SELECT role, content FROM messages WHERE conversation_id=? ORDER BY created_at",
+        (cid,)
+    ).fetchall()
+
+    if not history:
+        conn.close()
+        return
+
+    transcript_lines = []
+    for msg in history:
+        prefix = "User" if msg["role"] == "user" else "Assistant"
+        transcript_lines.append(f"{prefix}: {msg['content']}")
+    transcript = "\n".join(transcript_lines)
+
+    existing = [r["content"] for r in conn.execute(
+        "SELECT content FROM memory_entries ORDER BY updated_at DESC LIMIT 100"
+    ).fetchall()]
+    existing_str = "\n".join(f"- {m}" for m in existing) if existing else "None"
+
+    extraction_prompt = (
+        f"Full conversation:\n{transcript}\n\n"
+        f"Already stored (do not repeat these):\n{existing_str}\n\n"
+        "Extract every new fact worth remembering from the USER's messages above."
+    )
+
+    print(f"[memory] running extraction for conv {cid[:8]}...")
+
+    try:
+        raw = ""
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": MEMORY_EXTRACTION_PROMPT},
+                {"role": "user", "content": extraction_prompt}
+            ],
+            "temperature": 0.1,
+            "max_tokens": 4096,
+            "stream": True,
+        }
+        print(f"[memory] posting to {lm_url}/v1/chat/completions with model={model!r}")
+        async with httpx.AsyncClient(timeout=60) as client:
+            async with client.stream(
+                "POST",
+                f"{lm_url}/v1/chat/completions",
+                json=payload,
+                headers={"Content-Type": "application/json"}
+            ) as resp:
+                print(f"[memory] HTTP status: {resp.status_code}")
+                reasoning = ""
+                async for line in resp.aiter_lines():
+                    if not line.startswith("data: "):
+                        continue
+                    chunk_str = line[6:].strip()
+                    if chunk_str == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(chunk_str)
+                        delta = chunk["choices"][0]["delta"]
+                        # Collect both content and reasoning_content
+                        # Qwen3 thinking mode puts everything in reasoning_content
+                        for field in ("content", "reasoning_content"):
+                            val = delta.get(field)
+                            if val and isinstance(val, str):
+                                if field == "content":
+                                    raw += val
+                                else:
+                                    reasoning += val
+                    except Exception:
+                        continue
+                # If content is empty but reasoning has the answer, extract from reasoning
+                if not raw and reasoning:
+                    print(f"[memory] no content field, searching reasoning for JSON array...")
+                    # Find the last JSON array in the reasoning output
+                    matches = list(_re.finditer(r"\[.*?\]", reasoning, _re.DOTALL))
+                    if matches:
+                        raw = matches[-1].group(0)
+                        print(f"[memory] found array in reasoning: {raw!r}")
+                print(f"[memory] collected content: {raw!r}")
+
+        print(f"[memory] raw output: {raw!r}")
+
+        # Strip <think> blocks from reasoning models
+        raw = _re.sub(r"<think>.*?</think>", "", raw, flags=_re.DOTALL).strip()
+        raw = _re.sub(r"^```(?:json)?\s*", "", raw, flags=_re.MULTILINE)
+        raw = _re.sub(r"```\s*$", "", raw, flags=_re.MULTILINE)
+        raw = raw.strip()
+
+        # Find JSON array anywhere in output
+        match = _re.search(r"\[.*?\]", raw, _re.DOTALL)
+        if match:
+            raw = match.group(0)
+
+        memories = json.loads(raw)
+        if not isinstance(memories, list):
+            print("[memory] not a list, skipping")
+            conn.close()
+            return
+
+        print(f"[memory] extracted {len(memories)} candidates: {memories}")
+
+        saved = []
+        now = now_iso()
+        existing_lower = [e.lower() for e in existing]
+        for mem in memories:
+            mem = mem.strip()
+            if not mem:
+                continue
+            if mem.lower() in existing_lower:
+                print(f"[memory] duplicate, skipping: {mem!r}")
+                continue
+            mid = new_id()
+            conn.execute(
+                "INSERT INTO memory_entries (id, content, created_at, updated_at, source_conversation_id) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (mid, mem, now, now, cid)
+            )
+            saved.append(mem)
+            existing_lower.append(mem.lower())
+            print(f"[memory] saved: {mem!r}")
+
+        conn.commit()
+        conn.close()
+        print(f"[memory] done — saved {len(saved)} memories")
+
+    except Exception as e:
+        print(f"[memory] ERROR during extraction: {e}")
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+async def memory_queue_worker():
+    """Background worker — processes extraction jobs one at a time."""
+    print("[memory] queue worker started")
+    while True:
+        try:
+            job = await memory_queue.get()
+            cid, lm_url, model = job
+            print(f"[memory] got job for conv {cid[:8]}, waiting for server free...")
+            free = await wait_for_server_free(lm_url, max_wait=60)
+            if free:
+                await run_memory_extraction(cid, lm_url, model)
+            else:
+                print(f"[memory] server never became free, dropping job for {cid[:8]}")
+            memory_queue.task_done()
+        except asyncio.CancelledError:
+            print("[memory] queue worker stopped")
+            break
+        except Exception as e:
+            print(f"[memory] queue worker error: {e}")
+
+
+@app.post("/api/conversations/{cid}/extract-memory")
+async def extract_memory(cid: str, request: Request):
+    """Enqueue a memory extraction job — returns immediately, runs in background."""
+    conn = get_db()
+    settings = {r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM settings").fetchall()}
+    memory_enabled = settings.get("memory_enabled", "true") == "true"
+
+    if not memory_enabled:
+        conn.close()
+        return {"memories": [], "queued": False}
+
+    lm_url = settings.get("lm_studio_url", DEFAULT_LM_STUDIO_URL)
+    conv = conn.execute("SELECT model FROM conversations WHERE id=?", (cid,)).fetchone()
+    model = conv["model"] if conv else settings.get("default_model", "")
+    conn.close()
+
+    await memory_queue.put((cid, lm_url, model))
+    print(f"[memory] queued extraction for conv {cid[:8]}, queue size: {memory_queue.qsize()}")
+    return {"memories": [], "queued": True}
 
 
 # ---------------------------------------------------------------------------

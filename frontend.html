@@ -186,6 +186,7 @@
     content: '▋'; display: inline-block; animation: blink 1s step-end infinite; color: var(--accent);
   }
   @keyframes blink { 50% { opacity: 0; } }
+  @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
 
   /* Empty state */
   #empty-state {
@@ -412,6 +413,9 @@
           📎 RAG
         </div>
         <div class="char-count" id="char-count"></div>
+        <div id="memory-status" style="display:none;font-size:11px;color:var(--amber);display:flex;align-items:center;gap:5px;margin-left:auto">
+          <span style="display:inline-block;animation:spin 1s linear infinite">⟳</span> Updating memory...
+        </div>
       </div>
     </div>
   </main>
@@ -867,6 +871,31 @@ async function sendMessage() {
   // Refresh conversation title in sidebar
   await loadConversations();
   renderConvList();
+
+  // Background memory extraction — non-blocking
+  if (fullContent) {
+    extractMemoryInBackground(state.currentConvId, content, fullContent);
+  }
+}
+
+async function extractMemoryInBackground(convId, userMsg, assistantMsg) {
+  const memStatus = document.getElementById('memory-status');
+  memStatus.style.display = 'flex';
+  try {
+    const r = await fetch(`${API}/api/conversations/${convId}/extract-memory`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ user_message: userMsg, assistant_message: assistantMsg })
+    });
+    const data = await r.json();
+    if (data.memories && data.memories.length > 0) {
+      showNotif(`🧠 Remembered ${data.memories.length} new thing${data.memories.length > 1 ? 's' : ''}`, 'success');
+    }
+  } catch(e) {
+    // Silent fail — memory extraction is best-effort
+  } finally {
+    memStatus.style.display = 'none';
+  }
 }
 
 function handleInputKey(e) {
